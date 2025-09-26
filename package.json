@@ -1,13 +1,11 @@
 {
   "name": "blocket-preview",
-  "private": true,
-  "scripts": {
-    "start": "node index.js"
-  },
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "express": "^4.19.2",
-    "jsdom": "^24.0.0",
-    "node-fetch": "^3.3.2",
+    "express": "^4.18.2",
     "playwright": "^1.47.2"
   }
 }
