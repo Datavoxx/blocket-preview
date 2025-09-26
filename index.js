@@ -1,6 +1,6 @@
 // index.js
 const express = require('express');
-const fetch = require('node-fetch');
+const resp = await fetch(url);
 const { JSDOM } = require('jsdom');
 
 // Playwright är valfritt men bra när og:image kräver render
