@@ -1,116 +1,106 @@
 // index.js
-const express = require('express');
-const { JSDOM } = require('jsdom');
-const { chromium } = require('playwright');
+const express = require("express");
+const { chromium } = require("playwright");
 
 const app = express();
 app.use(express.json());
 
-// Healthcheck
-app.get('/', (_req, res) => res.send('OK'));
+// enkel hälsa
+app.get("/", (_req, res) => res.send("OK"));
 
-async function extractOg(html, finalUrl) {
-  const dom = new JSDOM(html);
-  const doc = dom.window.document;
+app.post("/preview", async (req, res) => {
+  const url = req.body && req.body.url;
+  if (!url) return res.status(400).json({ ok: false, error: "missing url" });
 
-  const pick = (sel) => doc.querySelector(sel)?.getAttribute('content')?.trim() || null;
-
-  // Försök JSON-LD först
-  let imageFromJsonLd = null;
-  doc.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
-    try {
-      const data = JSON.parse(s.textContent.trim());
-      const obj = Array.isArray(data) ? data[0] : data;
-      if (!imageFromJsonLd && obj?.image) {
-        if (typeof obj.image === 'string') imageFromJsonLd = obj.image;
-        else if (Array.isArray(obj.image)) imageFromJsonLd = obj.image[0];
-        else if (obj.image?.url) imageFromJsonLd = obj.image.url;
-      }
-    } catch {}
-  });
-
-  const title =
-    pick('meta[property="og:title"]') ||
-    pick('meta[name="twitter:title"]') ||
-    doc.querySelector('title')?.textContent?.trim() || null;
-
-  const description =
-    pick('meta[property="og:description"]') ||
-    pick('meta[name="description"]') ||
-    pick('meta[name="twitter:description"]') ||
-    null;
-
-  const image =
-    imageFromJsonLd ||
-    pick('meta[property="og:image"]') ||
-    pick('meta[name="twitter:image"]') ||
-    null;
-
-  return { ok: true, title, description, image_url: image, final_url: finalUrl };
-}
-
-async function fetchWithBrowser(url) {
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'], headless: true });
+  let browser;
   try {
-    const ctx = await browser.newContext({
+    browser = await chromium.launch({ args: ["--no-sandbox", "--disable-setuid-sandbox"], headless: true });
+    const context = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-      locale: 'sv-SE'
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "sv-SE"
     });
-    const page = await ctx.newPage();
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const html = await page.content();
-    const finalUrl = resp?.url() || url;
-    await ctx.close();
-    return { html, finalUrl };
-  } finally {
-    await browser.close();
-  }
-}
+    const page = await context.newPage();
 
-async function fetchWithHttp(url) {
-  const resp = await fetch(url, {
-    headers: {
-      'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-      accept: 'text/html,application/xhtml+xml'
-    },
-  });
-  const html = await resp.text();
-  const finalUrl = resp.url || url;
-  return { html, finalUrl };
-}
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-async function handlePreview(req, res) {
-  try {
-    const { url, force_browser } = req.body || {};
-    if (!url) return res.status(400).json({ ok: false, error: 'Missing url' });
+    // 1) Läs Next.js __NEXT_DATA__
+    const nextData = await page.evaluate(() => {
+      const el = document.getElementById("__NEXT_DATA__");
+      return el ? el.textContent : null;
+    });
 
-    // 1) Snabb väg: vanlig fetch
-    let { html, finalUrl } = await fetchWithHttp(url);
-    let og = await extractOg(html, finalUrl);
+    let title = null;
+    let imageUrl = null;
 
-    // 2) Fallback: Playwright om ingen bild eller om tvingat
-    if (force_browser || !og.image_url) {
-      const b = await fetchWithBrowser(url);
-      og = await extractOg(b.html, b.finalUrl);
+    try {
+      if (nextData) {
+        const data = JSON.parse(nextData);
+
+        // Blocket lägger lite olika – prova flera vägar
+        const ad =
+          data?.props?.pageProps?.ad ||
+          data?.props?.pageProps?.vehicle ||
+          data?.props?.pageProps ||
+          {};
+
+        title = ad?.subject || ad?.title || null;
+
+        const candidates =
+          ad?.images ||                 // vissa annonser
+          ad?.media?.images ||          // andra
+          ad?.gallery ||                // ibland "gallery"
+          [];
+
+        const grab = (v) =>
+          typeof v === "string" ? v : (v && typeof v.url === "string" ? v.url : null);
+
+        for (const im of candidates) {
+          const p = grab(im);
+          if (p && /blocketcdn\.se\/.*\.(jpg|jpeg|png)/i.test(p)) {
+            imageUrl = p;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2) Fallback – kolla DOM efter <img> + srcset
+    if (!imageUrl) {
+      const urls = await page.evaluate(() => {
+        const set = new Set();
+        document.querySelectorAll("img").forEach((img) => {
+          if (img.src) set.add(img.src);
+          if (img.srcset) {
+            img.srcset.split(",").forEach((part) => {
+              const u = part.trim().split(" ")[0];
+              if (u) set.add(u);
+            });
+          }
+        });
+        return Array.from(set);
+      });
+      const cand = (urls || []).find((u) =>
+        /blocketcdn\.se\/.*\.(jpg|jpeg|png)/i.test(u)
+      );
+      if (cand) imageUrl = cand;
     }
 
-    return res.json(og);
+    if (!title) title = await page.title();
+
+    await browser.close();
+
+    return res.json({
+      ok: true,
+      title: title || null,
+      image_url: imageUrl || null, // ← detta ska nu vara bilbilden från Blocket CDN
+      final_url: url
+    });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: e.message || 'failed' });
+    if (browser) try { await browser.close(); } catch {}
+    return res.status(500).json({ ok: false, error: e?.message || "render failed" });
   }
-}
+});
 
-// Stöd båda paths
-app.post('/api/url-preview', handlePreview);
-app.post('/url-preview', handlePreview);
-
-// 405 för GET
-app.get(['/api/url-preview', '/url-preview'], (_req, res) =>
-  res.status(405).json({ ok: false, error: 'Use POST' })
-);
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log('listening on ' + port));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Preview service running on", PORT));
