@@ -1,14 +1,12 @@
 // index.js
 const express = require('express');
-const resp = await fetch(url);
 const { JSDOM } = require('jsdom');
-
-// Playwright är valfritt men bra när og:image kräver render
 const { chromium } = require('playwright');
 
 const app = express();
 app.use(express.json());
 
+// Healthcheck
 app.get('/', (_req, res) => res.send('OK'));
 
 async function extractOg(html, finalUrl) {
@@ -17,7 +15,7 @@ async function extractOg(html, finalUrl) {
 
   const pick = (sel) => doc.querySelector(sel)?.getAttribute('content')?.trim() || null;
 
-  // Försök JSON-LD först (vissa sidor lägger image där)
+  // Försök JSON-LD först
   let imageFromJsonLd = null;
   doc.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
     try {
@@ -48,21 +46,16 @@ async function extractOg(html, finalUrl) {
     pick('meta[name="twitter:image"]') ||
     null;
 
-  return {
-    ok: true,
-    title,
-    description,
-    image_url: image,
-    final_url: finalUrl
-  };
+  return { ok: true, title, description, image_url: image, final_url: finalUrl };
 }
 
 async function fetchWithBrowser(url) {
-  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'], headless: true });
   try {
     const ctx = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+      locale: 'sv-SE'
     });
     const page = await ctx.newPage();
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -82,7 +75,6 @@ async function fetchWithHttp(url) {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
       accept: 'text/html,application/xhtml+xml'
     },
-    redirect: 'follow'
   });
   const html = await resp.text();
   const finalUrl = resp.url || url;
@@ -94,11 +86,11 @@ async function handlePreview(req, res) {
     const { url, force_browser } = req.body || {};
     if (!url) return res.status(400).json({ ok: false, error: 'Missing url' });
 
-    // 1) Försök vanlig fetch först (snabbast)
+    // 1) Snabb väg: vanlig fetch
     let { html, finalUrl } = await fetchWithHttp(url);
     let og = await extractOg(html, finalUrl);
 
-    // 2) Om ingen bild hittas eller force_browser=true → Playwright
+    // 2) Fallback: Playwright om ingen bild eller om tvingat
     if (force_browser || !og.image_url) {
       const b = await fetchWithBrowser(url);
       og = await extractOg(b.html, b.finalUrl);
@@ -111,11 +103,11 @@ async function handlePreview(req, res) {
   }
 }
 
-// Stöd båda vägarna
+// Stöd båda paths
 app.post('/api/url-preview', handlePreview);
 app.post('/url-preview', handlePreview);
 
-// 405 för GET på dessa
+// 405 för GET
 app.get(['/api/url-preview', '/url-preview'], (_req, res) =>
   res.status(405).json({ ok: false, error: 'Use POST' })
 );
