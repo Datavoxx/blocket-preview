@@ -5,8 +5,54 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json());
 
-// healthcheck (så Render ser att appen lever)
+// enkel healthcheck
 app.get("/", (_req, res) => res.send("OK"));
+
+// Hjälpfunktion: välj bästa bild-URL
+function pickBestImage(urls = []) {
+  const candidates = (urls || [])
+    .filter((u) => typeof u === "string")
+    // av-escapa ev. \u002F
+    .map((u) => u.split("\\u002F").join("/"))
+    // bara blocketcdn + bildformat
+    .filter((u) => /blocketcdn\.se/i.test(u))
+    .filter((u) => /\.(jpg|jpeg|png)(\?|$)/i.test(u))
+    // filtrera bort loggor
+    .filter(
+      (u) =>
+        !/static\/images\/blocketLogotype\.png/i.test(u) &&
+        !/logo|logotype/i.test(u) &&
+        !/dealer|handlare|firma/i.test(u)
+    );
+
+  const scored = candidates
+    .map((u) => {
+      let score = 0;
+
+      // fånga t.ex. 1200w
+      const widthMatch = u.match(/(\d{3,4})w/);
+      if (widthMatch) score += parseInt(widthMatch[1], 10);
+
+      // fånga t.ex. 800x600
+      const sizeMatch = u.match(/(\d{2,4})x(\d{2,4})/);
+      if (sizeMatch) {
+        const w = parseInt(sizeMatch[1], 10);
+        const h = parseInt(sizeMatch[2], 10);
+        const pixels = w * h;
+        score += Math.min(pixels / 100, 5000);
+      }
+
+      // prioritera stora/original
+      if (/full|large|original/i.test(u)) score += 2000;
+      // nedprioritera thumbnails
+      if (/thumb|small|mini/i.test(u)) score -= 2000;
+
+      return { u, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored.length ? scored[0].u : null;
+}
 
 app.post("/preview", async (req, res) => {
   const url = req.body && req.body.url;
@@ -36,35 +82,63 @@ app.post("/preview", async (req, res) => {
     let title = await page.title();
     let imageUrl = null;
 
-    // --- Försök 1: regexa bilder ur __NEXT_DATA__ ---
+    // --- Försök 1: läs strukturerad data ur __NEXT_DATA__ ---
     const nextData = await page.evaluate(
       () => document.getElementById("__NEXT_DATA__")?.textContent || null
     );
     if (nextData) {
       try {
-        // regexa ut blocketcdn-bilder
-        const re =
-          /https?:\/\/[^\s"\\]+blocketcdn\.se[^\s"\\]+\.(?:jpg|jpeg|png)/gi;
-        const matches = nextData.match(re);
-        if (matches && matches.length) {
-          const seen = new Set();
-          for (const m of matches) {
-            const u = m.split("\\u002F").join("/"); // av-escapa \u002F
-            if (seen.has(u)) continue;
-            seen.add(u);
-            imageUrl = u;
-            break;
-          }
-        }
-        // försök få mer exakt titel
         const data = JSON.parse(nextData);
+        const pageProps = data?.props?.pageProps || {};
         const ad =
-          data?.props?.pageProps?.ad ||
-          data?.props?.pageProps?.vehicle ||
-          data?.props?.pageProps ||
-          {};
+          pageProps.ad ||
+          pageProps.vehicle ||
+          pageProps.adData ||
+          pageProps.listing ||
+          pageProps;
+
+        // sätt titel så bra som möjligt
         title = ad?.subject || ad?.title || title || null;
-      } catch {}
+
+        // samla potentiella bildfält
+        const structuredUrls = [];
+
+        const pushUrl = (u) => {
+          if (u && typeof u === "string") structuredUrls.push(u);
+        };
+
+        const pushFromArray = (arr) => {
+          if (!Array.isArray(arr)) return;
+          for (const item of arr) {
+            if (!item) continue;
+            if (typeof item === "string") {
+              pushUrl(item);
+            } else if (typeof item === "object") {
+              pushUrl(item.url || item.src || item.href);
+            }
+          }
+        };
+
+        // vanliga fält på annonser
+        pushFromArray(ad.images);
+        pushFromArray(ad.imageUrls);
+        pushFromArray(ad.gallery);
+        pushFromArray(ad.media);
+
+        if (!imageUrl && structuredUrls.length) {
+          imageUrl = pickBestImage(structuredUrls);
+        }
+
+        // fallback: regexa bilder ur hela nextData om vi fortfarande saknar bild
+        if (!imageUrl) {
+          const re =
+            /https?:\/\/[^\s"\\]+blocketcdn\.se[^\s"\\]+\.(?:jpg|jpeg|png)/gi;
+          const matches = nextData.match(re) || [];
+          imageUrl = pickBestImage(matches);
+        }
+      } catch {
+        // ignorerar JSON-fel, går vidare till DOM-fallback
+      }
     }
 
     // --- Försök 2: DOM-fallback ---
@@ -83,24 +157,7 @@ app.post("/preview", async (req, res) => {
         return Array.from(set);
       });
 
-      const candidates = (urls || [])
-        .filter((u) => /blocketcdn\.se/i.test(u))
-        .filter((u) => /\.(jpg|jpeg|png)(\?|$)/i.test(u))
-        .filter(
-          (u) => !/static\/images\/blocketLogotype\.png/i.test(u) // hoppa över loggan
-        );
-
-      const scored = candidates
-        .map((u) => {
-          let score = 0;
-          const m = u.match(/(\d{3,4})w/); // t.ex. 1200w
-          if (m) score += parseInt(m[1], 10);
-          if (/full|large|original/i.test(u)) score += 2000;
-          return { u, score };
-        })
-        .sort((a, b) => b.score - a.score);
-
-      if (scored.length) imageUrl = scored[0].u;
+      imageUrl = pickBestImage(urls);
     }
 
     await browser.close();
