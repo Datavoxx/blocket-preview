@@ -12,28 +12,21 @@ app.get("/", (_req, res) => res.send("OK"));
 function pickBestImage(urls = []) {
   const candidates = (urls || [])
     .filter((u) => typeof u === "string")
-    // av-escapa ev. \u002F
-    .map((u) => u.split("\\u002F").join("/"))
-    // bara blocketcdn + bildformat
-    .filter((u) => /blocketcdn\.se/i.test(u))
-    .filter((u) => /\.(jpg|jpeg|png)(\?|$)/i.test(u))
-    // filtrera bort loggor
-    .filter(
-      (u) =>
-        !/static\/images\/blocketLogotype\.png/i.test(u) &&
-        !/logo|logotype/i.test(u) &&
-        !/dealer|handlare|firma/i.test(u)
-    );
+    .map((u) => u.split("\\u002F").join("/")); // av-escapa \u002F
 
   const scored = candidates
     .map((u) => {
       let score = 0;
 
-      // fånga t.ex. 1200w
+      // prioritet: blocketcdn + bildformat
+      if (/blocketcdn\.se/i.test(u)) score += 3000;
+      if (/\.(jpg|jpeg|png|webp)(\?|$)/i.test(u)) score += 1000;
+
+      // storlek i "1200w"
       const widthMatch = u.match(/(\d{3,4})w/);
       if (widthMatch) score += parseInt(widthMatch[1], 10);
 
-      // fånga t.ex. 800x600
+      // storlek i "800x600"
       const sizeMatch = u.match(/(\d{2,4})x(\d{2,4})/);
       if (sizeMatch) {
         const w = parseInt(sizeMatch[1], 10);
@@ -46,6 +39,15 @@ function pickBestImage(urls = []) {
       if (/full|large|original/i.test(u)) score += 2000;
       // nedprioritera thumbnails
       if (/thumb|small|mini/i.test(u)) score -= 2000;
+
+      // hårt minus för loggor, men inte total block
+      if (
+        /blocketLogotype\.png/i.test(u) ||
+        /logo|logotype/i.test(u) ||
+        /dealer|handlare|firma/i.test(u)
+      ) {
+        score -= 8000;
+      }
 
       return { u, score };
     })
@@ -97,16 +99,14 @@ app.post("/preview", async (req, res) => {
           pageProps.listing ||
           pageProps;
 
-        // sätt titel så bra som möjligt
+        // sätt titel
         title = ad?.subject || ad?.title || title || null;
 
-        // samla potentiella bildfält
+        // samla bild-URL:er från typiska fält
         const structuredUrls = [];
-
         const pushUrl = (u) => {
           if (u && typeof u === "string") structuredUrls.push(u);
         };
-
         const pushFromArray = (arr) => {
           if (!Array.isArray(arr)) return;
           for (const item of arr) {
@@ -119,7 +119,6 @@ app.post("/preview", async (req, res) => {
           }
         };
 
-        // vanliga fält på annonser
         pushFromArray(ad.images);
         pushFromArray(ad.imageUrls);
         pushFromArray(ad.gallery);
@@ -129,15 +128,15 @@ app.post("/preview", async (req, res) => {
           imageUrl = pickBestImage(structuredUrls);
         }
 
-        // fallback: regexa bilder ur hela nextData om vi fortfarande saknar bild
+        // fallback: regex över hela nextData
         if (!imageUrl) {
           const re =
-            /https?:\/\/[^\s"\\]+blocketcdn\.se[^\s"\\]+\.(?:jpg|jpeg|png)/gi;
+            /https?:\/\/[^\s"\\]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"\\]*)?/gi;
           const matches = nextData.match(re) || [];
           imageUrl = pickBestImage(matches);
         }
       } catch {
-        // ignorerar JSON-fel, går vidare till DOM-fallback
+        // ignorera JSON-fel
       }
     }
 
@@ -145,19 +144,45 @@ app.post("/preview", async (req, res) => {
     if (!imageUrl) {
       const urls = await page.evaluate(() => {
         const set = new Set();
+
         document.querySelectorAll("img").forEach((img) => {
-          if (img.src) set.add(img.src);
-          if (img.srcset) {
-            img.srcset.split(",").forEach((part) => {
+          const direct =
+            img.getAttribute("src") ||
+            img.getAttribute("data-src") ||
+            (img.dataset && (img.dataset.src || img.dataset.lazySrc));
+          if (direct) set.add(direct);
+
+          const srcset =
+            img.getAttribute("srcset") ||
+            img.getAttribute("data-srcset") ||
+            (img.dataset && (img.dataset.srcset || img.dataset.lazySrcset));
+
+          if (srcset) {
+            srcset.split(",").forEach((part) => {
               const u = part.trim().split(" ")[0];
               if (u) set.add(u);
             });
           }
         });
+
         return Array.from(set);
       });
 
       imageUrl = pickBestImage(urls);
+    }
+
+    // --- Sista fallback: ta första bästa bild om allt annat misslyckas ---
+    if (!imageUrl) {
+      const anyImg = await page.evaluate(() => {
+        const img = document.querySelector("img");
+        return img
+          ? img.getAttribute("src") ||
+              img.getAttribute("data-src") ||
+              (img.dataset && (img.dataset.src || img.dataset.lazySrc)) ||
+              null
+          : null;
+      });
+      imageUrl = anyImg || null;
     }
 
     await browser.close();
